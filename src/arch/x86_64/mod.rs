@@ -7,25 +7,27 @@
 
 pub mod bootinfo;
 pub mod paging;
-pub mod processor;
+pub mod physicalmem;
 pub mod serial;
 
 pub use self::bootinfo::*;
-use arch::x86_64::paging::{BasePageSize, LargePageSize, PageSize, PageTableEntryFlags};
-use arch::x86_64::serial::SerialPort;
+use crate::arch::x86_64::paging::{BasePageSize, LargePageSize, PageSize, PageTableEntryFlags};
+use crate::arch::x86_64::serial::SerialPort;
+use core::convert::TryInto;
+use core::intrinsics::copy;
 use core::{mem, slice};
-use elf::*;
+use goblin::elf;
 use multiboot::Multiboot;
-use physicalmem;
 
 extern "C" {
 	static mb_info: usize;
+	static kernel_end: u8;
 }
 
 // CONSTANTS
-pub const ELF_ARCH: u16 = ELF_EM_X86_64;
+pub const ELF_ARCH: u16 = elf::header::EM_X86_64;
 
-const KERNEL_STACK_SIZE: usize = 32_768;
+const KERNEL_STACK_SIZE: u64 = 32_768;
 const SERIAL_PORT_ADDRESS: u16 = 0x3F8;
 const SERIAL_PORT_BAUDRATE: u32 = 115200;
 
@@ -49,12 +51,12 @@ pub fn output_message_byte(byte: u8) {
 	COM1.write_byte(byte);
 }
 
-pub unsafe fn find_kernel() -> usize {
+pub unsafe fn find_kernel() -> &'static [u8] {
 	// Identity-map the Multiboot information.
 	assert!(mb_info > 0, "Could not find Multiboot information");
-	loaderlog!("Found Multiboot information at {:#X}", mb_info);
+	loaderlog!("Found Multiboot information at 0x{:x}", mb_info);
 	let page_address = align_down!(mb_info, BasePageSize::SIZE);
-	paging::map::<BasePageSize>(page_address, page_address, 1, PageTableEntryFlags::empty());
+	paging::map::<BasePageSize>(page_address, page_address, 1, PageTableEntryFlags::WRITABLE);
 
 	// Load the Multiboot information and identity-map the modules information.
 	let multiboot = Multiboot::new(mb_info as u64, paddr_to_slice).unwrap();
@@ -91,11 +93,11 @@ pub unsafe fn find_kernel() -> usize {
 		start_address,
 		end_address
 	);
+	let elf_start = start_address;
+	let elf_len = end_address - start_address;
+	loaderlog!("Module length: 0x{:x}", elf_len);
 
 	// Memory after the highest end address is unused and available for the physical memory manager.
-	// However, we want to move the HermitCore Application to the next 2 MB boundary.
-	// So add this boundary and align up the address to be on the safe side.
-	end_address += LargePageSize::SIZE;
 	physicalmem::init(align_up!(end_address, LargePageSize::SIZE));
 
 	// Identity-map the ELF header of the first module.
@@ -104,77 +106,60 @@ pub unsafe fn find_kernel() -> usize {
 		"Could not find a single module in the Multiboot information"
 	);
 	assert!(start_address > 0);
-	loaderlog!("Found an ELF module at {:#X}", start_address);
+	loaderlog!("Found an ELF module at 0x{:x}", start_address);
 	let page_address = align_down!(start_address, BasePageSize::SIZE);
-	paging::map::<BasePageSize>(page_address, page_address, 1, PageTableEntryFlags::empty());
-
-	start_address
-}
-
-pub unsafe fn move_kernel(
-	physical_address: usize,
-	virtual_address: usize,
-	mem_size: usize,
-	file_size: usize,
-) -> usize {
-	// We want to move the application to realize a identify mapping
-	let page_count = align_up!(mem_size, LargePageSize::SIZE) / LargePageSize::SIZE;
-	loaderlog!("Use {} large pages for the application.", page_count);
-
-	paging::map::<LargePageSize>(
-		virtual_address,
-		virtual_address,
-		page_count,
-		PageTableEntryFlags::WRITABLE,
-	);
-
-	for i in (0..align_up!(file_size, BasePageSize::SIZE) / BasePageSize::SIZE).rev() {
-		let tmp = 0x2000;
-		paging::map::<BasePageSize>(
-			tmp,
-			align_down!(physical_address, BasePageSize::SIZE) + i * BasePageSize::SIZE,
-			1,
-			PageTableEntryFlags::WRITABLE,
-		);
-
-		for j in 0..BasePageSize::SIZE {
-			*((virtual_address + i * BasePageSize::SIZE + j) as *mut u8) =
-				*((tmp + j) as *const u8);
-		}
-	}
-
-	// clear rest of the kernel
-	let start = file_size;
-	let end = mem_size;
+	let counter =
+		(align_up!(start_address, LargePageSize::SIZE) - page_address) / BasePageSize::SIZE;
 	loaderlog!(
-		"Clear BSS from 0x{:x} to 0x{:x}",
-		virtual_address + start,
-		virtual_address + end
+		"Map {} pages at 0x{:x} (page size {} KByte)",
+		counter,
+		page_address,
+		BasePageSize::SIZE / 1024
 	);
-	for i in start..end {
-		*((virtual_address + i) as *mut u8) = 0;
+	paging::map::<BasePageSize>(
+		page_address,
+		page_address,
+		counter,
+		PageTableEntryFlags::empty(),
+	);
+
+	// map also the rest of the module
+	let address = align_up!(start_address, LargePageSize::SIZE);
+	let counter = (align_up!(end_address, LargePageSize::SIZE) - address) / LargePageSize::SIZE;
+	if counter > 0 {
+		loaderlog!(
+			"Map {} pages at 0x{:x} (page size {} KByte)",
+			counter,
+			address,
+			LargePageSize::SIZE / 1024
+		);
+		paging::map::<LargePageSize>(address, address, counter, PageTableEntryFlags::WRITABLE);
 	}
 
-	virtual_address
+	slice::from_raw_parts(elf_start as *const u8, elf_len)
 }
 
-pub unsafe fn boot_kernel(
-	new_physical_address: usize,
-	virtual_address: usize,
-	mem_size: usize,
-	entry_point: usize,
-) {
+pub unsafe fn boot_kernel(virtual_address: u64, mem_size: u64, entry_point: u64) -> ! {
+	let new_addr = align_up!(&kernel_end as *const u8 as usize, LargePageSize::SIZE) as u64;
+
+	// copy app to the new start address
+	copy(
+		virtual_address as *const u8,
+		new_addr as *mut u8,
+		mem_size.try_into().unwrap(),
+	);
+
 	// Supply the parameters to the HermitCore application.
-	BOOT_INFO.base = new_physical_address as u64;
-	BOOT_INFO.image_size = mem_size as u64;
+	BOOT_INFO.base = new_addr;
+	BOOT_INFO.image_size = mem_size;
 	BOOT_INFO.mb_info = mb_info as u64;
-	BOOT_INFO.current_stack_address = (virtual_address - KERNEL_STACK_SIZE) as u64;
+	BOOT_INFO.current_stack_address = (new_addr - KERNEL_STACK_SIZE) as u64;
 
 	// map stack in the address space
 	paging::map::<BasePageSize>(
-		virtual_address - KERNEL_STACK_SIZE,
-		virtual_address - KERNEL_STACK_SIZE,
-		KERNEL_STACK_SIZE / BasePageSize::SIZE,
+		(new_addr - KERNEL_STACK_SIZE).try_into().unwrap(),
+		(new_addr - KERNEL_STACK_SIZE).try_into().unwrap(),
+		KERNEL_STACK_SIZE as usize / BasePageSize::SIZE,
 		PageTableEntryFlags::WRITABLE,
 	);
 
@@ -195,9 +180,29 @@ pub unsafe fn boot_kernel(
 	}
 
 	// Jump to the kernel entry point and provide the Multiboot information to it.
+	let entry_point = entry_point - virtual_address + new_addr;
 	loaderlog!(
-		"Jumping to HermitCore Application Entry Point at {:#X}",
+		"Jumping to HermitCore Application Entry Point at 0x{:x}",
 		entry_point
 	);
-	llvm_asm!("jmp *$0" :: "r"(entry_point), "{rdi}"(&BOOT_INFO as *const _ as usize) : "memory" : "volatile");
+	let func: extern "C" fn(boot_info: &'static mut BootInfo) -> ! =
+		core::mem::transmute(entry_point);
+
+	func(&mut BOOT_INFO);
+
+	// we never reach this point
+}
+
+unsafe fn map_memory(address: usize, memory_size: usize) -> usize {
+	let address = align_up!(address, LargePageSize::SIZE);
+	let page_count = align_up!(memory_size, LargePageSize::SIZE) / LargePageSize::SIZE;
+
+	paging::map::<LargePageSize>(address, address, page_count, PageTableEntryFlags::WRITABLE);
+
+	address
+}
+
+pub unsafe fn get_memory(memory_size: u64) -> u64 {
+	let address = physicalmem::allocate(align_up!(memory_size as usize, LargePageSize::SIZE));
+	map_memory(address, memory_size as usize) as u64
 }

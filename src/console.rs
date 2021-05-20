@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use arch;
+use crate::arch;
 use core::fmt;
 
 pub struct Console;
@@ -14,6 +14,14 @@ pub struct Console;
 /// a message to HermitCore's console.
 impl fmt::Write for Console {
 	/// Print a single character.
+	#[cfg(feature = "aarch64-qemu-stdout")]
+	fn write_char(&mut self, c: char) -> fmt::Result {
+		unsafe {
+			core::ptr::write_volatile(0x3F20_1000 as *mut u8, c as u8); //qemu raspi3
+		}
+		Ok(())
+	}
+	#[cfg(not(feature = "aarch64-qemu-stdout"))]
 	fn write_char(&mut self, c: char) -> fmt::Result {
 		arch::output_message_byte(c as u8);
 		Ok(())
